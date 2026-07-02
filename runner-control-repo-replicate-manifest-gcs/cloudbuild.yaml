@@ -1,0 +1,48 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - '-t'
+      - >-
+        $_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/runner-control/$_SERVICE_NAME:$COMMIT_SHA
+      - .
+    id: Build
+
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - >-
+        $_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/runner-control/$_SERVICE_NAME:$COMMIT_SHA
+    id: Push
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    args:
+      - run
+      - deploy
+      - $_SERVICE_NAME
+      - '--platform=managed'
+      - >-
+        --image=$_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/runner-control/$_SERVICE_NAME:$COMMIT_SHA
+      - '--region=$_DEPLOY_REGION'
+      - '--set-env-vars=GCP_PROJECT_ID=$_AR_PROJECT_ID,GCP_REGION=$_DEPLOY_REGION,ARTIFACT_REPOSITORY=model-images,MODEL_LIMIT=0,MAX_REPLICATE_PAGES=200,MANIFEST_BUCKET=backendoutputs,MANIFEST_OBJECT=Manifest/replicate_manifest.json,USE_GCS_MANIFEST=true'
+      - '--quiet'
+    id: Deploy
+    entrypoint: gcloud
+
+images:
+  - >-
+    $_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/runner-control/$_SERVICE_NAME:$COMMIT_SHA
+
+options:
+  substitutionOption: ALLOW_LOOSE
+  logging: CLOUD_LOGGING_ONLY
+
+substitutions:
+  _DEPLOY_REGION: us-central1
+  _AR_REPOSITORY: cloud-run-source-deploy
+  _SERVICE_NAME: runner-control
+  _AR_HOSTNAME: us-central1-docker.pkg.dev
+  _AR_PROJECT_ID: just-looking-472401
+
+tags:
+  - runner-control

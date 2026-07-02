@@ -1,0 +1,12 @@
+{
+  "schema_version": "runner-manifest-v1",
+  "generated_at": null,
+  "source": "empty-seed",
+  "deployment_mode": "self_deploy",
+  "target_task_bucket": "image",
+  "target_model_families": [
+    "sdxl"
+  ],
+  "models_count": 0,
+  "models": []
+}
