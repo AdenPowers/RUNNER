@@ -3,9 +3,12 @@ import json
 import os
 import re
 import time
+import threading
+import traceback
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import quote, urlparse
 
 import requests
@@ -45,6 +48,104 @@ GPU_MIN_INSTANCES = int(os.environ.get("GPU_MIN_INSTANCES", "0"))
 GPU_MAX_INSTANCES = int(os.environ.get("GPU_MAX_INSTANCES", "1"))
 
 app = FastAPI(title="Runner Replicate Manifest Control")
+
+AGGREGATION_LOCK = threading.Lock()
+AGGREGATION_JOB: Dict[str, Any] = {
+    "job_id": None,
+    "status": "idle",
+    "started_at": None,
+    "finished_at": None,
+    "limit": None,
+    "pages": None,
+    "inspect_github": None,
+    "current_page": 0,
+    "total_seen": 0,
+    "models_kept": 0,
+    "repos_inspected": 0,
+    "single_cog": 0,
+    "multi_cog": 0,
+    "no_cog": 0,
+    "repo_error": 0,
+    "gcs_write": None,
+    "error": None,
+    "logs": [],
+}
+
+
+def aggregation_snapshot() -> Dict[str, Any]:
+    with AGGREGATION_LOCK:
+        return json.loads(json.dumps(AGGREGATION_JOB, ensure_ascii=False))
+
+
+def aggregation_log(message: str, **fields: Any) -> None:
+    event = {"time": now_iso(), "message": message}
+    if fields:
+        event.update(fields)
+    with AGGREGATION_LOCK:
+        AGGREGATION_JOB.setdefault("logs", []).append(event)
+        AGGREGATION_JOB["logs"] = AGGREGATION_JOB["logs"][-250:]
+        for key, value in fields.items():
+            if key in AGGREGATION_JOB:
+                AGGREGATION_JOB[key] = value
+
+
+def aggregation_set(**fields: Any) -> None:
+    with AGGREGATION_LOCK:
+        AGGREGATION_JOB.update(fields)
+
+
+def start_aggregation_job(limit: int, pages: int, inspect_github: bool) -> Dict[str, Any]:
+    with AGGREGATION_LOCK:
+        if AGGREGATION_JOB.get("status") == "running":
+            return json.loads(json.dumps(AGGREGATION_JOB, ensure_ascii=False))
+        AGGREGATION_JOB.clear()
+        AGGREGATION_JOB.update({
+            "job_id": str(uuid.uuid4()),
+            "status": "running",
+            "started_at": now_iso(),
+            "finished_at": None,
+            "limit": limit,
+            "pages": pages,
+            "inspect_github": inspect_github,
+            "current_page": 0,
+            "total_seen": 0,
+            "models_kept": 0,
+            "repos_inspected": 0,
+            "single_cog": 0,
+            "multi_cog": 0,
+            "no_cog": 0,
+            "repo_error": 0,
+            "gcs_write": None,
+            "error": None,
+            "logs": [{"time": now_iso(), "message": "aggregation job queued"}],
+        })
+
+    def runner() -> None:
+        try:
+            aggregation_log("aggregation started", limit=limit, pages=pages, inspect_github=inspect_github)
+            manifest = aggregate_replicate_manifest(
+                limit=limit,
+                pages=pages,
+                inspect_github=inspect_github,
+                progress=aggregation_log,
+            )
+            aggregation_set(
+                status="done",
+                finished_at=now_iso(),
+                models_kept=manifest.get("models_count", 0),
+                gcs_write=manifest.get("gcs_write"),
+            )
+            aggregation_log("aggregation finished", models_kept=manifest.get("models_count", 0), gcs_write=manifest.get("gcs_write"))
+        except Exception as e:
+            aggregation_set(
+                status="error",
+                finished_at=now_iso(),
+                error={"type": type(e).__name__, "message": str(e), "traceback": traceback.format_exc()[-5000:]},
+            )
+            aggregation_log("aggregation failed", error_type=type(e).__name__, error=str(e))
+
+    threading.Thread(target=runner, daemon=True).start()
+    return aggregation_snapshot()
 
 
 class BuildRequest(BaseModel):
@@ -338,7 +439,16 @@ def download_manifest_from_gcs() -> Optional[Dict[str, Any]]:
         return None
 
 
-def aggregate_replicate_manifest(limit: int = MODEL_LIMIT, pages: int = MAX_REPLICATE_PAGES, inspect_github: bool = True) -> Dict[str, Any]:
+def aggregate_replicate_manifest(
+    limit: int = MODEL_LIMIT,
+    pages: int = MAX_REPLICATE_PAGES,
+    inspect_github: bool = True,
+    progress: Optional[Callable[..., None]] = None,
+) -> Dict[str, Any]:
+    def emit(message: str, **fields: Any) -> None:
+        if progress:
+            progress(message, **fields)
+
     kept: List[Dict[str, Any]] = []
     inspected_repos: Dict[str, Any] = {}
     counts = {
@@ -354,10 +464,16 @@ def aggregate_replicate_manifest(limit: int = MODEL_LIMIT, pages: int = MAX_REPL
     url = "https://api.replicate.com/v1/models"
     page = 0
 
+    emit("replicate crawl starting", current_page=0, total_seen=0, models_kept=0)
+
     while url and page < pages:
         page += 1
+        emit("fetching replicate page", current_page=page, total_seen=counts["total_seen"], models_kept=len(kept))
         data = http_get_json(url, headers_replicate())
-        for raw in data.get("results") or []:
+        page_results = data.get("results") or []
+        emit("replicate page fetched", current_page=page, page_models=len(page_results), total_seen=counts["total_seen"], models_kept=len(kept))
+
+        for raw in page_results:
             if limit and len(kept) >= limit:
                 break
             counts["total_seen"] += 1
@@ -377,10 +493,12 @@ def aggregate_replicate_manifest(limit: int = MODEL_LIMIT, pages: int = MAX_REPL
             inspection = None
             if repo and inspect_github:
                 if repo not in inspected_repos:
+                    emit("inspecting github repo", repo=repo, repos_inspected=len(inspected_repos), total_seen=counts["total_seen"], models_kept=len(kept))
                     try:
                         inspected_repos[repo] = inspect_github_repo(repo)
                     except Exception as e:
                         inspected_repos[repo] = {"ok": False, "repo": repo, "error": str(e)}
+                    emit("github repo inspection complete", repo=repo, repos_inspected=len(inspected_repos), total_seen=counts["total_seen"], models_kept=len(kept))
                     time.sleep(0.08)
                 inspection = inspected_repos[repo]
                 if inspection.get("ok"):
@@ -416,6 +534,32 @@ def aggregate_replicate_manifest(limit: int = MODEL_LIMIT, pages: int = MAX_REPL
                 m["candidate_status"] = "replicate_metadata_only"
 
             kept.append(m)
+
+            if counts["total_seen"] % 50 == 0:
+                emit(
+                    "aggregation checkpoint",
+                    current_page=page,
+                    total_seen=counts["total_seen"],
+                    models_kept=len(kept),
+                    repos_inspected=len(inspected_repos),
+                    single_cog=counts["single_cog"],
+                    multi_cog=counts["multi_cog"],
+                    no_cog=counts["no_cog"],
+                    repo_error=counts["repo_error"],
+                )
+
+        emit(
+            "page complete",
+            current_page=page,
+            total_seen=counts["total_seen"],
+            models_kept=len(kept),
+            repos_inspected=len(inspected_repos),
+            single_cog=counts["single_cog"],
+            multi_cog=counts["multi_cog"],
+            no_cog=counts["no_cog"],
+            repo_error=counts["repo_error"],
+        )
+
         if limit and len(kept) >= limit:
             break
         url = data.get("next")
@@ -434,11 +578,13 @@ def aggregate_replicate_manifest(limit: int = MODEL_LIMIT, pages: int = MAX_REPL
         "gcs_target": f"gs://{MANIFEST_BUCKET}/{MANIFEST_OBJECT}",
         "models": kept,
     }
+    emit("writing manifest to local cache", models_kept=len(kept))
     save_json(MANIFEST_PATH, manifest)
+    emit("writing manifest to gcs", gcs_target=f"gs://{MANIFEST_BUCKET}/{MANIFEST_OBJECT}", models_kept=len(kept))
     manifest["gcs_write"] = upload_manifest_to_gcs(manifest)
+    emit("gcs write complete", gcs_write=manifest.get("gcs_write"), models_kept=len(kept))
     save_json(MANIFEST_PATH, manifest)
     return manifest
-
 
 def default_manifest() -> Dict[str, Any]:
     return {
@@ -645,13 +791,28 @@ def reload_gcs_manifest():
     return manifest
 
 
+@app.post("/admin/aggregate/start")
+def aggregate_start(
+    limit: int = Query(default=MODEL_LIMIT, ge=0, le=5000),
+    pages: int = Query(default=MAX_REPLICATE_PAGES, ge=1, le=1000),
+    inspect_github: bool = Query(default=True),
+):
+    return start_aggregation_job(limit=limit, pages=pages, inspect_github=inspect_github)
+
+
+@app.get("/admin/aggregate/status")
+def aggregate_status():
+    return aggregation_snapshot()
+
+
 @app.post("/admin/refresh")
 def refresh_manifest(
     limit: int = Query(default=MODEL_LIMIT, ge=0, le=5000),
     pages: int = Query(default=MAX_REPLICATE_PAGES, ge=1, le=1000),
     inspect_github: bool = Query(default=True),
 ):
-    return aggregate_replicate_manifest(limit=limit, pages=pages, inspect_github=inspect_github)
+    # Backward-compatible endpoint. This now starts the background job instead of blocking the browser request.
+    return start_aggregation_job(limit=limit, pages=pages, inspect_github=inspect_github)
 
 
 @app.get("/models")
@@ -731,6 +892,7 @@ def home():
     .grid { display:grid; grid-template-columns: 430px 1fr; gap:20px; }
     .card { border:1px solid #333; border-radius:14px; padding:14px; margin:10px 0; background:#151922; }
     .pill { display:inline-block; border:1px solid #555; border-radius:999px; padding:2px 8px; margin:2px; font-size:12px; }
+    .logbox { max-height:260px; overflow:auto; white-space:pre-wrap; font-size:12px; }
     button { padding:10px 14px; border-radius:10px; border:0; cursor:pointer; margin:4px; }
     input, select { padding:10px; border-radius:10px; border:1px solid #333; background:#101521; color:#f2f2f2; margin:4px; }
     pre, textarea { background:#101521; color:#dfe7ff; border:1px solid #333; border-radius:10px; padding:12px; width:100%; box-sizing:border-box; }
@@ -743,6 +905,7 @@ def home():
   <button onclick="aggregateManifest()">Aggregate Replicate manifest → GCS</button>
   <button onclick="reloadGcs()">Reload GCS manifest</button>
   <button onclick="loadModels()">Reload UI</button>
+  <div id="jobSummary" class="card" style="display:none;"></div>
   <div>
     <input id="search" placeholder="filter: sdxl, image, lucataco, etc." oninput="loadModels()" />
     <select id="task" onchange="loadModels()"><option value="">all tasks</option><option value="image">image</option><option value="llm">llm</option><option value="audio">audio</option><option value="video">video</option><option value="3d">3d</option><option value="unknown">unknown</option></select>
@@ -762,27 +925,117 @@ def home():
   </div>
 <script>
 let selected = null;
-async function api(path, opts={}) { const res = await fetch(path, opts); const text = await res.text(); let payload; try { payload = JSON.parse(text); } catch(e) { payload = {raw:text}; } if (!res.ok) return {http_status: res.status, error: payload}; return payload; }
+let aggregationPoll = null;
+
+async function api(path, opts={}) {
+  const res = await fetch(path, opts);
+  const text = await res.text();
+  let payload;
+  try { payload = JSON.parse(text); } catch(e) { payload = {raw:text}; }
+  if (!res.ok) return {http_status: res.status, error: payload};
+  return payload;
+}
+
+function renderJob(job) {
+  const el = document.getElementById('jobSummary');
+  if (!job || !job.status || job.status === 'idle') {
+    el.style.display = 'none';
+    return;
+  }
+  el.style.display = 'block';
+  const logs = (job.logs || []).slice(-80).map(x => {
+    let line = `${x.time || ''} ${x.message || ''}`;
+    if (x.repo) line += ` repo=${x.repo}`;
+    if (x.current_page) line += ` page=${x.current_page}`;
+    if (x.total_seen) line += ` seen=${x.total_seen}`;
+    if (x.models_kept) line += ` kept=${x.models_kept}`;
+    if (x.repos_inspected) line += ` repos=${x.repos_inspected}`;
+    if (x.error) line += ` error=${x.error}`;
+    return line;
+  }).join('\n');
+  el.innerHTML = `<b>Aggregation job:</b> ${job.status} &nbsp; ` +
+    `<span class="pill">page ${job.current_page || 0}/${job.pages || ''}</span>` +
+    `<span class="pill">seen ${job.total_seen || 0}</span>` +
+    `<span class="pill">kept ${job.models_kept || 0}</span>` +
+    `<span class="pill">repos ${job.repos_inspected || 0}</span>` +
+    `<span class="pill">single Cog ${job.single_cog || 0}</span>` +
+    `<div class="logbox">${logs}</div>`;
+}
+
+async function pollAggregation() {
+  const job = await api('/admin/aggregate/status');
+  renderJob(job);
+  if (job.status === 'done' || job.status === 'error') {
+    if (aggregationPoll) clearInterval(aggregationPoll);
+    aggregationPoll = null;
+    if (job.status === 'done') await loadModels();
+  }
+}
+
 async function loadModels() {
   const q = encodeURIComponent(document.getElementById('search').value || '');
   const task = encodeURIComponent(document.getElementById('task').value || '');
   const cogOnly = document.getElementById('cogOnly').checked ? 'true' : 'false';
   const data = await api(`/models?q=${q}&task=${task}&cog_only=${cogOnly}&limit=250`);
   document.getElementById('summary').innerHTML = `<p>Manifest rows shown: ${data.models_count || 0}. Total manifest: ${data.manifest_models_count || 0}. Generated: ${data.manifest_generated_at || 'not yet'}<br>Source: ${data.gcs_target || ''}</p>`;
-  const el = document.getElementById('models'); el.innerHTML = '';
+  const el = document.getElementById('models');
+  el.innerHTML = '';
   (data.models || []).forEach(m => {
-    const div = document.createElement('div'); div.className = 'card';
+    const div = document.createElement('div');
+    div.className = 'card';
     div.innerHTML = `<h3>${m.model_id}</h3><span class="pill">${m.task_bucket || ''}</span><span class="pill">${m.model_family || ''}</span><span class="pill">${m.candidate_status || ''}</span><div>${m.github_repo || ''}</div><div>Cog count: ${m.cog_count ?? ''}</div><div>Build: ${m.build_status || 'not built'}</div>${m.build_logs_url ? `<div><a href="${m.build_logs_url}" target="_blank">Build logs</a></div>` : ''}<p>${(m.description || '').slice(0,220)}</p><button>Select</button>`;
-    div.querySelector('button').onclick = () => selectModel(m.model_id); el.appendChild(div);
+    div.querySelector('button').onclick = () => selectModel(m.model_id);
+    el.appendChild(div);
   });
 }
-async function selectModel(id) { selected = id; const data = await api('/model?model_id=' + encodeURIComponent(id)); document.getElementById('title').textContent = id; document.getElementById('inputJson').value = JSON.stringify(data.default_input || {}, null, 2); document.getElementById('status').textContent = JSON.stringify(data, null, 2); document.getElementById('actions').innerHTML = `<button onclick="buildSelected()">Build image</button><button onclick="statusSelected()">Check build status</button><button onclick="deploySelected()">Deploy L4 endpoint</button>`; }
-async function buildSelected() { if (!selected) return; const data = await api('/build?model_id=' + encodeURIComponent(selected), {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'}); document.getElementById('status').textContent = JSON.stringify(data, null, 2); loadModels(); }
-async function statusSelected() { if (!selected) return; const data = await api('/build/status?model_id=' + encodeURIComponent(selected)); document.getElementById('status').textContent = JSON.stringify(data, null, 2); loadModels(); }
-async function deploySelected() { if (!selected) return; const data = await api('/deploy?model_id=' + encodeURIComponent(selected), {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'}); document.getElementById('status').textContent = JSON.stringify(data, null, 2); loadModels(); }
-async function aggregateManifest() { const data = await api('/admin/refresh?limit=0&pages=200&inspect_github=true', {method:'POST'}); document.getElementById('status').textContent = JSON.stringify(data, null, 2); loadModels(); }
-async function reloadGcs() { const data = await api('/admin/reload-gcs', {method:'POST'}); document.getElementById('status').textContent = JSON.stringify(data, null, 2); loadModels(); }
+
+async function selectModel(id) {
+  selected = id;
+  const data = await api('/model?model_id=' + encodeURIComponent(id));
+  document.getElementById('title').textContent = id;
+  document.getElementById('inputJson').value = JSON.stringify(data.default_input || {}, null, 2);
+  document.getElementById('status').textContent = JSON.stringify(data, null, 2);
+  document.getElementById('actions').innerHTML = `<button onclick="buildSelected()">Build image</button><button onclick="statusSelected()">Check build status</button><button onclick="deploySelected()">Deploy L4 endpoint</button>`;
+}
+
+async function buildSelected() {
+  if (!selected) return;
+  const data = await api('/build?model_id=' + encodeURIComponent(selected), {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+  document.getElementById('status').textContent = JSON.stringify(data, null, 2);
+  loadModels();
+}
+
+async function statusSelected() {
+  if (!selected) return;
+  const data = await api('/build/status?model_id=' + encodeURIComponent(selected));
+  document.getElementById('status').textContent = JSON.stringify(data, null, 2);
+  loadModels();
+}
+
+async function deploySelected() {
+  if (!selected) return;
+  const data = await api('/deploy?model_id=' + encodeURIComponent(selected), {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+  document.getElementById('status').textContent = JSON.stringify(data, null, 2);
+  loadModels();
+}
+
+async function aggregateManifest() {
+  const data = await api('/admin/aggregate/start?limit=0&pages=200&inspect_github=true', {method:'POST'});
+  document.getElementById('status').textContent = JSON.stringify(data, null, 2);
+  renderJob(data);
+  if (aggregationPoll) clearInterval(aggregationPoll);
+  aggregationPoll = setInterval(pollAggregation, 2500);
+  pollAggregation();
+}
+
+async function reloadGcs() {
+  const data = await api('/admin/reload-gcs', {method:'POST'});
+  document.getElementById('status').textContent = JSON.stringify(data, null, 2);
+  loadModels();
+}
+
 loadModels();
+pollAggregation();
 </script>
 </body>
 </html>
