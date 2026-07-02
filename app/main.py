@@ -38,6 +38,7 @@ MAX_REPLICATE_PAGES = int(os.environ.get("MAX_REPLICATE_PAGES", "200"))
 MANIFEST_BUCKET = os.environ.get("MANIFEST_BUCKET", "backendoutputs")
 MANIFEST_OBJECT = os.environ.get("MANIFEST_OBJECT", "Manifest/replicate_manifest.json")
 USE_GCS_MANIFEST = os.environ.get("USE_GCS_MANIFEST", "true").lower() not in {"0", "false", "no"}
+PROGRESSIVE_GCS_FLUSH_EVERY = int(os.environ.get("PROGRESSIVE_GCS_FLUSH_EVERY", "1"))  # 1 means upload every appended model
 
 GPU_TYPE = os.environ.get("GPU_TYPE", "nvidia-l4")
 GPU_COUNT = int(os.environ.get("GPU_COUNT", "1"))
@@ -439,6 +440,33 @@ def download_manifest_from_gcs() -> Optional[Dict[str, Any]]:
         return None
 
 
+def make_replicate_manifest(
+    kept: List[Dict[str, Any]],
+    counts: Dict[str, Any],
+    pages: int,
+    limit: int,
+    generated_at: Optional[str] = None,
+    gcs_write: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    manifest = {
+        "schema_version": "replicate-manifest-v1",
+        "generated_at": generated_at or now_iso(),
+        "source": "replicate+github_tree_direct_crawl",
+        "description": "Whole Replicate manifest crawl. No direct task-query appendage. Replicate is metadata/sample-input source; self-deploy candidates are identified from GitHub Cog repo trees.",
+        "deployment_mode": "self_deploy_candidates_plus_metadata",
+        "max_replicate_pages": pages,
+        "model_limit": limit,
+        "models_count": len(kept),
+        "counts": counts,
+        "gcs_target": f"gs://{MANIFEST_BUCKET}/{MANIFEST_OBJECT}",
+        "progressive": True,
+        "models": kept,
+    }
+    if gcs_write is not None:
+        manifest["gcs_write"] = gcs_write
+    return manifest
+
+
 def aggregate_replicate_manifest(
     limit: int = MODEL_LIMIT,
     pages: int = MAX_REPLICATE_PAGES,
@@ -463,8 +491,50 @@ def aggregate_replicate_manifest(
     }
     url = "https://api.replicate.com/v1/models"
     page = 0
+    generated_at = now_iso()
+    last_gcs_write: Optional[Dict[str, Any]] = None
+
+    def flush_progressive_manifest(reason: str, force_gcs: bool = False) -> None:
+        nonlocal last_gcs_write
+        manifest = make_replicate_manifest(
+            kept=kept,
+            counts=counts,
+            pages=pages,
+            limit=limit,
+            generated_at=generated_at,
+            gcs_write=last_gcs_write,
+        )
+        save_json(MANIFEST_PATH, manifest)
+
+        should_upload = force_gcs or (
+            PROGRESSIVE_GCS_FLUSH_EVERY > 0
+            and len(kept) > 0
+            and len(kept) % PROGRESSIVE_GCS_FLUSH_EVERY == 0
+        )
+        if should_upload:
+            try:
+                last_gcs_write = upload_manifest_to_gcs(manifest)
+                manifest["gcs_write"] = last_gcs_write
+                save_json(MANIFEST_PATH, manifest)
+                emit(
+                    "progressive manifest flushed",
+                    flush_reason=reason,
+                    models_kept=len(kept),
+                    gcs_write=last_gcs_write,
+                )
+            except Exception as e:
+                last_gcs_write = {"uploaded": False, "error_type": type(e).__name__, "error": str(e)}
+                manifest["gcs_write"] = last_gcs_write
+                save_json(MANIFEST_PATH, manifest)
+                emit(
+                    "progressive gcs flush failed",
+                    flush_reason=reason,
+                    models_kept=len(kept),
+                    gcs_write=last_gcs_write,
+                )
 
     emit("replicate crawl starting", current_page=0, total_seen=0, models_kept=0)
+    flush_progressive_manifest("job_start", force_gcs=True)
 
     while url and page < pages:
         page += 1
@@ -534,6 +604,7 @@ def aggregate_replicate_manifest(
                 m["candidate_status"] = "replicate_metadata_only"
 
             kept.append(m)
+            flush_progressive_manifest("model_appended")
 
             if counts["total_seen"] % 50 == 0:
                 emit(
@@ -548,6 +619,7 @@ def aggregate_replicate_manifest(
                     repo_error=counts["repo_error"],
                 )
 
+        flush_progressive_manifest("page_complete", force_gcs=True)
         emit(
             "page complete",
             current_page=page,
@@ -565,24 +637,22 @@ def aggregate_replicate_manifest(
         url = data.get("next")
         time.sleep(0.08)
 
-    manifest = {
-        "schema_version": "replicate-manifest-v1",
-        "generated_at": now_iso(),
-        "source": "replicate+github_tree_direct_crawl",
-        "description": "Whole Replicate manifest crawl. No direct task-query appendage. Replicate is metadata/sample-input source; self-deploy candidates are identified from GitHub Cog repo trees.",
-        "deployment_mode": "self_deploy_candidates_plus_metadata",
-        "max_replicate_pages": pages,
-        "model_limit": limit,
-        "models_count": len(kept),
-        "counts": counts,
-        "gcs_target": f"gs://{MANIFEST_BUCKET}/{MANIFEST_OBJECT}",
-        "models": kept,
-    }
-    emit("writing manifest to local cache", models_kept=len(kept))
+    manifest = make_replicate_manifest(
+        kept=kept,
+        counts=counts,
+        pages=pages,
+        limit=limit,
+        generated_at=generated_at,
+        gcs_write=last_gcs_write,
+    )
+    emit("writing final manifest to local cache", models_kept=len(kept))
     save_json(MANIFEST_PATH, manifest)
-    emit("writing manifest to gcs", gcs_target=f"gs://{MANIFEST_BUCKET}/{MANIFEST_OBJECT}", models_kept=len(kept))
-    manifest["gcs_write"] = upload_manifest_to_gcs(manifest)
-    emit("gcs write complete", gcs_write=manifest.get("gcs_write"), models_kept=len(kept))
+    emit("writing final manifest to gcs", gcs_target=f"gs://{MANIFEST_BUCKET}/{MANIFEST_OBJECT}", models_kept=len(kept))
+    try:
+        manifest["gcs_write"] = upload_manifest_to_gcs(manifest)
+    except Exception as e:
+        manifest["gcs_write"] = {"uploaded": False, "error_type": type(e).__name__, "error": str(e)}
+    emit("final gcs write complete", gcs_write=manifest.get("gcs_write"), models_kept=len(kept))
     save_json(MANIFEST_PATH, manifest)
     return manifest
 
@@ -817,7 +887,8 @@ def refresh_manifest(
 
 @app.get("/models")
 def models(q: str = "", task: str = "", cog_only: bool = False, limit: int = 250):
-    manifest = load_manifest(refresh_from_gcs=True)
+    job = aggregation_snapshot()
+    manifest = load_manifest(refresh_from_gcs=(job.get("status") != "running"))
     s = state()
     ql = q.lower().strip()
     rows = []
@@ -965,6 +1036,10 @@ function renderJob(job) {
 async function pollAggregation() {
   const job = await api('/admin/aggregate/status');
   renderJob(job);
+  if (job.status === 'running') {
+    await loadModels();
+    return;
+  }
   if (job.status === 'done' || job.status === 'error') {
     if (aggregationPoll) clearInterval(aggregationPoll);
     aggregationPoll = null;
