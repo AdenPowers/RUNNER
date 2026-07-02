@@ -1,0 +1,9 @@
+{
+  "schema_version": "replicate-manifest-v1",
+  "generated_at": null,
+  "source": "empty-seed",
+  "deployment_mode": "self_deploy_candidates_plus_metadata",
+  "models_count": 0,
+  "gcs_target": "gs://backendoutputs/Manifest/replicate_manifest.json",
+  "models": []
+}
