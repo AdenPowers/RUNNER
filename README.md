@@ -28,3 +28,9 @@ Secret references:
 
 
 This build is narrowed to SDXL image-model self-deployment only. Replicate data is used as metadata/sample input; endpoints are intended to be self-hosted on Cloud Run GPU after image build.
+
+
+## UI Marker
+UI ITERATION 001 — native-refresh-10
+
+The page shows this marker fixed at top left so deployed UI revisions are visually identifiable.

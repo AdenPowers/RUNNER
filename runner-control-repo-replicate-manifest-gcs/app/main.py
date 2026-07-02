@@ -880,6 +880,8 @@ def home():
   <title>Runner Replicate Manifest Control</title>
   <style>
     body { font-family: system-ui, sans-serif; background:#0b0f17; color:#f2f2f2; margin:24px; }
+    .iteration-badge { position:fixed; top:8px; left:8px; z-index:9999; background:#ffd84d; color:#111; border:2px solid #111; border-radius:8px; padding:6px 10px; font-weight:800; font-size:13px; box-shadow:0 2px 10px rgba(0,0,0,.35); }
+    .iteration-spacer { height:26px; }
     .grid { display:grid; grid-template-columns: 430px 1fr; gap:20px; }
     .card { border:1px solid #333; border-radius:14px; padding:14px; margin:10px 0; background:#151922; }
     .pill { display:inline-block; border:1px solid #555; border-radius:999px; padding:2px 8px; margin:2px; font-size:12px; }
@@ -891,6 +893,8 @@ def home():
   </style>
 </head>
 <body>
+  <div class="iteration-badge">UI ITERATION 001 — native-refresh-10</div>
+  <div class="iteration-spacer"></div>
   <h1>Runner Replicate Manifest Control</h1>
   <button onclick="aggregateManifest()">Aggregate Replicate manifest → GCS</button>
   <button onclick="reloadGcs()">Reload GCS manifest</button>
@@ -932,7 +936,7 @@ async function selectModel(id) { selected = id; const data = await api('/model?m
 async function buildSelected() { if (!selected) return; const data = await api('/build?model_id=' + encodeURIComponent(selected), {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'}); document.getElementById('status').textContent = JSON.stringify(data, null, 2); loadModels(); }
 async function statusSelected() { if (!selected) return; const data = await api('/build/status?model_id=' + encodeURIComponent(selected)); document.getElementById('status').textContent = JSON.stringify(data, null, 2); loadModels(); }
 async function deploySelected() { if (!selected) return; const data = await api('/deploy?model_id=' + encodeURIComponent(selected), {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'}); document.getElementById('status').textContent = JSON.stringify(data, null, 2); loadModels(); }
-async function aggregateManifest() { document.getElementById('status').textContent = 'Running native aggregate: limit=10 pages=1...'; const data = await api('/admin/refresh?limit=10&pages=1&inspect_github=true', {method:'POST'}); document.getElementById('status').textContent = JSON.stringify(data, null, 2); loadModels(); }
+async function aggregateManifest() { document.getElementById('status').textContent = 'UI ITERATION 001 — native-refresh-10\nRunning native aggregate: limit=10 pages=1...'; const data = await api('/admin/refresh?limit=10&pages=1&inspect_github=true', {method:'POST'}); document.getElementById('status').textContent = JSON.stringify(data, null, 2); loadModels(); }
 async function reloadGcs() { const data = await api('/admin/reload-gcs', {method:'POST'}); document.getElementById('status').textContent = JSON.stringify(data, null, 2); loadModels(); }
 loadModels();
 </script>
