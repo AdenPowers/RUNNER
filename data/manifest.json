@@ -1,0 +1,8 @@
+{
+  "schema_version": "runner-manifest-v1",
+  "generated_at": null,
+  "source": "empty-seed",
+  "target_model_families": ["sdxl", "small-llm"],
+  "models_count": 0,
+  "models": []
+}
