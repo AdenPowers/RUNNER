@@ -38,7 +38,6 @@ MAX_REPLICATE_PAGES = int(os.environ.get("MAX_REPLICATE_PAGES", "200"))
 MANIFEST_BUCKET = os.environ.get("MANIFEST_BUCKET", "backendoutputs")
 MANIFEST_OBJECT = os.environ.get("MANIFEST_OBJECT", "Manifest/replicate_manifest.json")
 USE_GCS_MANIFEST = os.environ.get("USE_GCS_MANIFEST", "true").lower() not in {"0", "false", "no"}
-PROGRESSIVE_GCS_FLUSH_EVERY = int(os.environ.get("PROGRESSIVE_GCS_FLUSH_EVERY", "1"))  # 1 means upload every appended model
 
 GPU_TYPE = os.environ.get("GPU_TYPE", "nvidia-l4")
 GPU_COUNT = int(os.environ.get("GPU_COUNT", "1"))
@@ -440,30 +439,66 @@ def download_manifest_from_gcs() -> Optional[Dict[str, Any]]:
         return None
 
 
-def make_replicate_manifest(
+def build_replicate_manifest_payload(
+    *,
     kept: List[Dict[str, Any]],
+    discarded: List[Dict[str, Any]],
     counts: Dict[str, Any],
     pages: int,
     limit: int,
-    generated_at: Optional[str] = None,
+    status: str,
     gcs_write: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     manifest = {
         "schema_version": "replicate-manifest-v1",
-        "generated_at": generated_at or now_iso(),
+        "generated_at": now_iso(),
         "source": "replicate+github_tree_direct_crawl",
-        "description": "Whole Replicate manifest crawl. No direct task-query appendage. Replicate is metadata/sample-input source; self-deploy candidates are identified from GitHub Cog repo trees.",
-        "deployment_mode": "self_deploy_candidates_plus_metadata",
+        "description": "Replicate model crawl. Replicate provides metadata/sample input. GitHub repo trees decide Cog-backed self-deploy candidacy. Non-Cog rows are discarded instead of appended to the app manifest.",
+        "deployment_mode": "self_deploy_candidates_from_cog_repos",
+        "build_status": status,
         "max_replicate_pages": pages,
         "model_limit": limit,
         "models_count": len(kept),
+        "discarded_count": len(discarded),
         "counts": counts,
         "gcs_target": f"gs://{MANIFEST_BUCKET}/{MANIFEST_OBJECT}",
-        "progressive": True,
         "models": kept,
+        "discarded": discarded,
     }
     if gcs_write is not None:
         manifest["gcs_write"] = gcs_write
+    return manifest
+
+
+def flush_progressive_manifest(
+    *,
+    kept: List[Dict[str, Any]],
+    discarded: List[Dict[str, Any]],
+    counts: Dict[str, Any],
+    pages: int,
+    limit: int,
+    status: str,
+    emit: Callable[..., None],
+) -> Dict[str, Any]:
+    manifest = build_replicate_manifest_payload(
+        kept=kept,
+        discarded=discarded,
+        counts=counts,
+        pages=pages,
+        limit=limit,
+        status=status,
+    )
+    save_json(MANIFEST_PATH, manifest)
+
+    gcs_write: Dict[str, Any]
+    try:
+        gcs_write = upload_manifest_to_gcs(manifest)
+    except Exception as e:
+        gcs_write = {"uploaded": False, "error_type": type(e).__name__, "error": str(e)}
+
+    manifest["gcs_write"] = gcs_write
+    save_json(MANIFEST_PATH, manifest)
+    emit("progressive manifest flushed", models_kept=len(kept), discarded_count=len(discarded), gcs_write=gcs_write)
     return manifest
 
 
@@ -478,6 +513,7 @@ def aggregate_replicate_manifest(
             progress(message, **fields)
 
     kept: List[Dict[str, Any]] = []
+    discarded: List[Dict[str, Any]] = []
     inspected_repos: Dict[str, Any] = {}
     counts = {
         "total_seen": 0,
@@ -488,53 +524,15 @@ def aggregate_replicate_manifest(
         "single_cog": 0,
         "multi_cog": 0,
         "no_cog": 0,
+        "discarded_no_github": 0,
+        "discarded_github_failed": 0,
+        "discarded_no_cog": 0,
     }
     url = "https://api.replicate.com/v1/models"
     page = 0
-    generated_at = now_iso()
-    last_gcs_write: Optional[Dict[str, Any]] = None
-
-    def flush_progressive_manifest(reason: str, force_gcs: bool = False) -> None:
-        nonlocal last_gcs_write
-        manifest = make_replicate_manifest(
-            kept=kept,
-            counts=counts,
-            pages=pages,
-            limit=limit,
-            generated_at=generated_at,
-            gcs_write=last_gcs_write,
-        )
-        save_json(MANIFEST_PATH, manifest)
-
-        should_upload = force_gcs or (
-            PROGRESSIVE_GCS_FLUSH_EVERY > 0
-            and len(kept) > 0
-            and len(kept) % PROGRESSIVE_GCS_FLUSH_EVERY == 0
-        )
-        if should_upload:
-            try:
-                last_gcs_write = upload_manifest_to_gcs(manifest)
-                manifest["gcs_write"] = last_gcs_write
-                save_json(MANIFEST_PATH, manifest)
-                emit(
-                    "progressive manifest flushed",
-                    flush_reason=reason,
-                    models_kept=len(kept),
-                    gcs_write=last_gcs_write,
-                )
-            except Exception as e:
-                last_gcs_write = {"uploaded": False, "error_type": type(e).__name__, "error": str(e)}
-                manifest["gcs_write"] = last_gcs_write
-                save_json(MANIFEST_PATH, manifest)
-                emit(
-                    "progressive gcs flush failed",
-                    flush_reason=reason,
-                    models_kept=len(kept),
-                    gcs_write=last_gcs_write,
-                )
+    final_manifest: Optional[Dict[str, Any]] = None
 
     emit("replicate crawl starting", current_page=0, total_seen=0, models_kept=0)
-    flush_progressive_manifest("job_start", force_gcs=True)
 
     while url and page < pages:
         page += 1
@@ -546,10 +544,13 @@ def aggregate_replicate_manifest(
         for raw in page_results:
             if limit and len(kept) >= limit:
                 break
+
             counts["total_seen"] += 1
             m = slim_model(raw)
             if not m.get("model_id"):
+                discarded.append({"discard_reason": "missing_model_id", "model": m})
                 continue
+
             m.update(detect_task_family(m))
             m["source"] = "replicate_metadata"
             m["sample_input_source"] = "replicate_default_example"
@@ -559,67 +560,110 @@ def aggregate_replicate_manifest(
                 counts["with_github"] += 1
             else:
                 counts["without_github"] += 1
+                counts["discarded_no_github"] += 1
+                discarded.append({"discard_reason": "no_github_repo", "model": m})
+                emit("discarded model without github repo", total_seen=counts["total_seen"], models_kept=len(kept))
+                continue
 
-            inspection = None
-            if repo and inspect_github:
-                if repo not in inspected_repos:
-                    emit("inspecting github repo", repo=repo, repos_inspected=len(inspected_repos), total_seen=counts["total_seen"], models_kept=len(kept))
-                    try:
-                        inspected_repos[repo] = inspect_github_repo(repo)
-                    except Exception as e:
-                        inspected_repos[repo] = {"ok": False, "repo": repo, "error": str(e)}
-                    emit("github repo inspection complete", repo=repo, repos_inspected=len(inspected_repos), total_seen=counts["total_seen"], models_kept=len(kept))
-                    time.sleep(0.08)
-                inspection = inspected_repos[repo]
-                if inspection.get("ok"):
-                    counts["repo_ok"] += 1
-                    cog_count = len(inspection.get("cog_paths") or [])
-                    if cog_count == 1:
-                        counts["single_cog"] += 1
-                        m["candidate_status"] = "single_cog_self_deploy_candidate"
-                    elif cog_count > 1:
-                        counts["multi_cog"] += 1
-                        m["candidate_status"] = "multi_cog_needs_route_selection"
-                    else:
-                        counts["no_cog"] += 1
-                        m["candidate_status"] = "github_no_cog"
-                    m["repo"] = {
-                        "repo_key": repo,
-                        "github_repo_full_name": inspection.get("github_repo_full_name"),
-                        "default_branch": inspection.get("default_branch"),
-                        "tree_truncated": inspection.get("tree_truncated"),
-                        "file_count": inspection.get("file_count"),
-                        "cog_count": cog_count,
-                        "cog_paths": inspection.get("cog_paths") or [],
-                        "project_routes": inspection.get("project_routes") or [],
-                    }
-                    if cog_count == 1:
-                        m["deployment_mode"] = "self_deploy_candidate"
-                        m["build_target"] = build_target_metadata(m)
-                else:
-                    counts["repo_error"] += 1
-                    m["candidate_status"] = "github_inspection_error"
-                    m["repo"] = inspection
+            if not inspect_github:
+                counts["discarded_github_failed"] += 1
+                discarded.append({"discard_reason": "github_inspection_disabled", "github_repo": repo, "model": m})
+                emit("discarded because github inspection disabled", repo=repo, total_seen=counts["total_seen"], models_kept=len(kept))
+                continue
+
+            if repo not in inspected_repos:
+                emit("inspecting github repo", repo=repo, repos_inspected=len(inspected_repos), total_seen=counts["total_seen"], models_kept=len(kept))
+                try:
+                    inspected_repos[repo] = inspect_github_repo(repo)
+                except Exception as e:
+                    inspected_repos[repo] = {"ok": False, "repo": repo, "error": str(e)}
+                emit("github repo inspection complete", repo=repo, repos_inspected=len(inspected_repos), total_seen=counts["total_seen"], models_kept=len(kept))
+                time.sleep(0.08)
+
+            inspection = inspected_repos[repo]
+            if not inspection.get("ok"):
+                counts["repo_error"] += 1
+                counts["discarded_github_failed"] += 1
+                discarded.append({
+                    "discard_reason": "github_inspection_failed",
+                    "github_repo": repo,
+                    "github_url": m.get("github_url"),
+                    "repo_error": inspection.get("error"),
+                    "model": m,
+                })
+                emit("discarded after github inspection failure", repo=repo, repo_error=inspection.get("error"), total_seen=counts["total_seen"], models_kept=len(kept))
+                continue
+
+            counts["repo_ok"] += 1
+            cog_paths = inspection.get("cog_paths") or []
+            project_routes = inspection.get("project_routes") or []
+            cog_count = len(cog_paths)
+
+            if not cog_paths:
+                counts["no_cog"] += 1
+                counts["discarded_no_cog"] += 1
+                discarded.append({
+                    "discard_reason": "no_cog_found",
+                    "github_repo": repo,
+                    "github_url": m.get("github_url"),
+                    "github_repo_full_name": inspection.get("github_repo_full_name"),
+                    "default_branch": inspection.get("default_branch"),
+                    "tree_truncated": inspection.get("tree_truncated"),
+                    "file_count": inspection.get("file_count"),
+                    "model": m,
+                })
+                emit("discarded repo with no cog", repo=repo, total_seen=counts["total_seen"], models_kept=len(kept), no_cog=counts["no_cog"])
+                continue
+
+            if cog_count == 1:
+                counts["single_cog"] += 1
+                candidate_status = "single_cog_confident"
             else:
-                m["candidate_status"] = "replicate_metadata_only"
+                counts["multi_cog"] += 1
+                candidate_status = "multi_cog_needs_mapping"
 
-            kept.append(m)
-            flush_progressive_manifest("model_appended")
+            enriched = dict(m)
+            enriched["candidate_status"] = candidate_status
+            enriched["deployment_mode"] = "self_deploy_candidate"
+            enriched["repo"] = {
+                "repo_key": repo,
+                "github_repo_full_name": inspection.get("github_repo_full_name"),
+                "default_branch": inspection.get("default_branch"),
+                "tree_truncated": inspection.get("tree_truncated"),
+                "file_count": inspection.get("file_count"),
+                "cog_count": cog_count,
+                "cog_paths": cog_paths,
+                "project_routes": project_routes,
+                "file_paths": inspection.get("file_paths") or [],
+            }
+            if cog_count == 1:
+                enriched["build_target"] = build_target_metadata(enriched)
 
-            if counts["total_seen"] % 50 == 0:
-                emit(
-                    "aggregation checkpoint",
-                    current_page=page,
-                    total_seen=counts["total_seen"],
-                    models_kept=len(kept),
-                    repos_inspected=len(inspected_repos),
-                    single_cog=counts["single_cog"],
-                    multi_cog=counts["multi_cog"],
-                    no_cog=counts["no_cog"],
-                    repo_error=counts["repo_error"],
-                )
+            kept.append(enriched)
+            emit(
+                "appended cog-backed model",
+                model_id=enriched.get("model_id"),
+                candidate_status=candidate_status,
+                current_page=page,
+                total_seen=counts["total_seen"],
+                models_kept=len(kept),
+                repos_inspected=len(inspected_repos),
+                single_cog=counts["single_cog"],
+                multi_cog=counts["multi_cog"],
+                no_cog=counts["no_cog"],
+                repo_error=counts["repo_error"],
+            )
 
-        flush_progressive_manifest("page_complete", force_gcs=True)
+            final_manifest = flush_progressive_manifest(
+                kept=kept,
+                discarded=discarded,
+                counts=counts,
+                pages=pages,
+                limit=limit,
+                status="running",
+                emit=emit,
+            )
+
         emit(
             "page complete",
             current_page=page,
@@ -637,24 +681,17 @@ def aggregate_replicate_manifest(
         url = data.get("next")
         time.sleep(0.08)
 
-    manifest = make_replicate_manifest(
+    emit("writing final manifest", models_kept=len(kept), discarded_count=len(discarded))
+    final_manifest = flush_progressive_manifest(
         kept=kept,
+        discarded=discarded,
         counts=counts,
         pages=pages,
         limit=limit,
-        generated_at=generated_at,
-        gcs_write=last_gcs_write,
+        status="complete",
+        emit=emit,
     )
-    emit("writing final manifest to local cache", models_kept=len(kept))
-    save_json(MANIFEST_PATH, manifest)
-    emit("writing final manifest to gcs", gcs_target=f"gs://{MANIFEST_BUCKET}/{MANIFEST_OBJECT}", models_kept=len(kept))
-    try:
-        manifest["gcs_write"] = upload_manifest_to_gcs(manifest)
-    except Exception as e:
-        manifest["gcs_write"] = {"uploaded": False, "error_type": type(e).__name__, "error": str(e)}
-    emit("final gcs write complete", gcs_write=manifest.get("gcs_write"), models_kept=len(kept))
-    save_json(MANIFEST_PATH, manifest)
-    return manifest
+    return final_manifest
 
 def default_manifest() -> Dict[str, Any]:
     return {
@@ -887,8 +924,7 @@ def refresh_manifest(
 
 @app.get("/models")
 def models(q: str = "", task: str = "", cog_only: bool = False, limit: int = 250):
-    job = aggregation_snapshot()
-    manifest = load_manifest(refresh_from_gcs=(job.get("status") != "running"))
+    manifest = load_manifest(refresh_from_gcs=aggregation_snapshot().get("status") != "running")
     s = state()
     ql = q.lower().strip()
     rows = []
@@ -976,13 +1012,13 @@ def home():
   <button onclick="aggregateManifest()">Aggregate Replicate manifest → GCS</button>
   <button onclick="reloadGcs()">Reload GCS manifest</button>
   <button onclick="loadModels()">Reload UI</button>
-  <div id="jobSummary" class="card"><b>Aggregation job:</b> not started</div>
+  <div id="jobSummary" class="card" style="display:none;"></div>
   <div>
     <input id="search" placeholder="filter: sdxl, image, lucataco, etc." oninput="loadModels()" />
     <select id="task" onchange="loadModels()"><option value="">all tasks</option><option value="image">image</option><option value="llm">llm</option><option value="audio">audio</option><option value="video">video</option><option value="3d">3d</option><option value="unknown">unknown</option></select>
     <label><input id="cogOnly" type="checkbox" onchange="loadModels()" /> single Cog only</label>
   </div>
-  <div id="summary"><p>Loading manifest...</p></div>
+  <div id="summary"></div>
   <div class="grid">
     <div><h2>Models</h2><div id="models"></div></div>
     <div>
@@ -995,134 +1031,115 @@ def home():
     </div>
   </div>
 <script>
-var selected = null;
-var aggregationPoll = null;
+let selected = null;
+let aggregationPoll = null;
 
-async function api(path, opts) {
-  opts = opts || {};
-  var res = await fetch(path, opts);
-  var text = await res.text();
-  var payload;
+async function api(path, opts={}) {
+  const res = await fetch(path, opts);
+  const text = await res.text();
+  let payload;
   try { payload = JSON.parse(text); } catch(e) { payload = {raw:text}; }
-  if (!res.ok) payload.http_status = res.status;
+  if (!res.ok) return {http_status: res.status, error: payload};
   return payload;
 }
 
 function renderJob(job) {
-  var el = document.getElementById('jobSummary');
+  const el = document.getElementById('jobSummary');
   if (!job || !job.status || job.status === 'idle') {
-    el.innerHTML = '<b>Aggregation job:</b> not started';
+    el.style.display = 'none';
     return;
   }
-  var rows = job.logs || [];
-  var logs = rows.slice(-80).map(function(x) {
-    var line = (x.time || '') + ' ' + (x.message || '');
-    if (x.repo) line += ' repo=' + x.repo;
-    if (x.current_page) line += ' page=' + x.current_page;
-    if (x.total_seen) line += ' seen=' + x.total_seen;
-    if (x.models_kept) line += ' kept=' + x.models_kept;
-    if (x.repos_inspected) line += ' repos=' + x.repos_inspected;
-    if (x.error) line += ' error=' + x.error;
+  el.style.display = 'block';
+  const logs = (job.logs || []).slice(-80).map(x => {
+    let line = `${x.time || ''} ${x.message || ''}`;
+    if (x.repo) line += ` repo=${x.repo}`;
+    if (x.current_page) line += ` page=${x.current_page}`;
+    if (x.total_seen) line += ` seen=${x.total_seen}`;
+    if (x.models_kept) line += ` kept=${x.models_kept}`;
+    if (x.repos_inspected) line += ` repos=${x.repos_inspected}`;
+    if (x.error) line += ` error=${x.error}`;
     return line;
   }).join('\n');
-  el.innerHTML = '<b>Aggregation job:</b> ' + job.status + ' &nbsp; ' +
-    '<span class="pill">page ' + (job.current_page || 0) + '/' + (job.pages || '') + '</span>' +
-    '<span class="pill">seen ' + (job.total_seen || 0) + '</span>' +
-    '<span class="pill">kept ' + (job.models_kept || 0) + '</span>' +
-    '<span class="pill">repos ' + (job.repos_inspected || 0) + '</span>' +
-    '<span class="pill">single Cog ' + (job.single_cog || 0) + '</span>' +
-    '<div class="logbox"></div>';
-  el.querySelector('.logbox').textContent = logs;
+  el.innerHTML = `<b>Aggregation job:</b> ${job.status} &nbsp; ` +
+    `<span class="pill">page ${job.current_page || 0}/${job.pages || ''}</span>` +
+    `<span class="pill">seen ${job.total_seen || 0}</span>` +
+    `<span class="pill">kept ${job.models_kept || 0}</span>` +
+    `<span class="pill">repos ${job.repos_inspected || 0}</span>` +
+    `<span class="pill">single Cog ${job.single_cog || 0}</span>` +
+    `<div class="logbox">${logs}</div>`;
 }
 
 async function pollAggregation() {
-  var job = await api('/admin/aggregate/status');
+  const job = await api('/admin/aggregate/status');
   renderJob(job);
   if (job.status === 'running') {
     await loadModels();
-    return;
   }
   if (job.status === 'done' || job.status === 'error') {
     if (aggregationPoll) clearInterval(aggregationPoll);
     aggregationPoll = null;
-    await loadModels();
+    if (job.status === 'done') await loadModels();
   }
 }
 
 async function loadModels() {
-  var q = encodeURIComponent(document.getElementById('search').value || '');
-  var task = encodeURIComponent(document.getElementById('task').value || '');
-  var cogOnly = document.getElementById('cogOnly').checked ? 'true' : 'false';
-  var data = await api('/models?q=' + q + '&task=' + task + '&cog_only=' + cogOnly + '&limit=250');
-  if (data.http_status) {
-    document.getElementById('summary').innerHTML = '<p>Models request failed: HTTP ' + data.http_status + '</p>';
-    document.getElementById('status').textContent = JSON.stringify(data, null, 2);
-    return;
-  }
-  document.getElementById('summary').innerHTML = '<p>Manifest rows shown: ' + (data.models_count || 0) + '. Total manifest: ' + (data.manifest_models_count || 0) + '. Generated: ' + (data.manifest_generated_at || 'not yet') + '<br>Source: ' + (data.gcs_target || '') + '</p>';
-  var el = document.getElementById('models');
+  const q = encodeURIComponent(document.getElementById('search').value || '');
+  const task = encodeURIComponent(document.getElementById('task').value || '');
+  const cogOnly = document.getElementById('cogOnly').checked ? 'true' : 'false';
+  const data = await api(`/models?q=${q}&task=${task}&cog_only=${cogOnly}&limit=250`);
+  document.getElementById('summary').innerHTML = `<p>Manifest rows shown: ${data.models_count || 0}. Total manifest: ${data.manifest_models_count || 0}. Generated: ${data.manifest_generated_at || 'not yet'}<br>Source: ${data.gcs_target || ''}</p>`;
+  const el = document.getElementById('models');
   el.innerHTML = '';
-  (data.models || []).forEach(function(m) {
-    var div = document.createElement('div');
+  (data.models || []).forEach(m => {
+    const div = document.createElement('div');
     div.className = 'card';
-    var link = '';
-    if (m.build_logs_url) link = '<div><a href="' + m.build_logs_url + '" target="_blank">Build logs</a></div>';
-    div.innerHTML = '<h3>' + (m.model_id || '') + '</h3>' +
-      '<span class="pill">' + (m.task_bucket || '') + '</span>' +
-      '<span class="pill">' + (m.model_family || '') + '</span>' +
-      '<span class="pill">' + (m.candidate_status || '') + '</span>' +
-      '<div>' + (m.github_repo || '') + '</div>' +
-      '<div>Cog count: ' + (m.cog_count == null ? '' : m.cog_count) + '</div>' +
-      '<div>Build: ' + (m.build_status || 'not built') + '</div>' +
-      link + '<p>' + ((m.description || '').slice(0,220)) + '</p><button>Select</button>';
-    div.querySelector('button').onclick = function() { selectModel(m.model_id); };
+    div.innerHTML = `<h3>${m.model_id}</h3><span class="pill">${m.task_bucket || ''}</span><span class="pill">${m.model_family || ''}</span><span class="pill">${m.candidate_status || ''}</span><div>${m.github_repo || ''}</div><div>Cog count: ${m.cog_count ?? ''}</div><div>Build: ${m.build_status || 'not built'}</div>${m.build_logs_url ? `<div><a href="${m.build_logs_url}" target="_blank">Build logs</a></div>` : ''}<p>${(m.description || '').slice(0,220)}</p><button>Select</button>`;
+    div.querySelector('button').onclick = () => selectModel(m.model_id);
     el.appendChild(div);
   });
 }
 
 async function selectModel(id) {
   selected = id;
-  var data = await api('/model?model_id=' + encodeURIComponent(id));
+  const data = await api('/model?model_id=' + encodeURIComponent(id));
   document.getElementById('title').textContent = id;
   document.getElementById('inputJson').value = JSON.stringify(data.default_input || {}, null, 2);
   document.getElementById('status').textContent = JSON.stringify(data, null, 2);
-  document.getElementById('actions').innerHTML = '<button onclick="buildSelected()">Build image</button><button onclick="statusSelected()">Check build status</button><button onclick="deploySelected()">Deploy L4 endpoint</button>';
+  document.getElementById('actions').innerHTML = `<button onclick="buildSelected()">Build image</button><button onclick="statusSelected()">Check build status</button><button onclick="deploySelected()">Deploy L4 endpoint</button>`;
 }
 
 async function buildSelected() {
   if (!selected) return;
-  var data = await api('/build?model_id=' + encodeURIComponent(selected), {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+  const data = await api('/build?model_id=' + encodeURIComponent(selected), {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
   document.getElementById('status').textContent = JSON.stringify(data, null, 2);
   loadModels();
 }
 
 async function statusSelected() {
   if (!selected) return;
-  var data = await api('/build/status?model_id=' + encodeURIComponent(selected));
+  const data = await api('/build/status?model_id=' + encodeURIComponent(selected));
   document.getElementById('status').textContent = JSON.stringify(data, null, 2);
   loadModels();
 }
 
 async function deploySelected() {
   if (!selected) return;
-  var data = await api('/deploy?model_id=' + encodeURIComponent(selected), {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+  const data = await api('/deploy?model_id=' + encodeURIComponent(selected), {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
   document.getElementById('status').textContent = JSON.stringify(data, null, 2);
   loadModels();
 }
 
 async function aggregateManifest() {
-  document.getElementById('jobSummary').innerHTML = '<b>Aggregation job:</b> starting...';
-  document.getElementById('status').textContent = 'Starting aggregation...';
-  var data = await api('/admin/aggregate/start?limit=0&pages=200&inspect_github=true', {method:'POST'});
+  const data = await api('/admin/aggregate/start?limit=0&pages=200&inspect_github=true', {method:'POST'});
   document.getElementById('status').textContent = JSON.stringify(data, null, 2);
   renderJob(data);
   if (aggregationPoll) clearInterval(aggregationPoll);
-  aggregationPoll = setInterval(pollAggregation, 1000);
+  aggregationPoll = setInterval(pollAggregation, 2500);
   pollAggregation();
 }
 
 async function reloadGcs() {
-  var data = await api('/admin/reload-gcs', {method:'POST'});
+  const data = await api('/admin/reload-gcs', {method:'POST'});
   document.getElementById('status').textContent = JSON.stringify(data, null, 2);
   loadModels();
 }
