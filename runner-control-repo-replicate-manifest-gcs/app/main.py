@@ -976,13 +976,13 @@ def home():
   <button onclick="aggregateManifest()">Aggregate Replicate manifest → GCS</button>
   <button onclick="reloadGcs()">Reload GCS manifest</button>
   <button onclick="loadModels()">Reload UI</button>
-  <div id="jobSummary" class="card" style="display:none;"></div>
+  <div id="jobSummary" class="card"><b>Aggregation job:</b> not started</div>
   <div>
     <input id="search" placeholder="filter: sdxl, image, lucataco, etc." oninput="loadModels()" />
     <select id="task" onchange="loadModels()"><option value="">all tasks</option><option value="image">image</option><option value="llm">llm</option><option value="audio">audio</option><option value="video">video</option><option value="3d">3d</option><option value="unknown">unknown</option></select>
     <label><input id="cogOnly" type="checkbox" onchange="loadModels()" /> single Cog only</label>
   </div>
-  <div id="summary"></div>
+  <div id="summary"><p>Loading manifest...</p></div>
   <div class="grid">
     <div><h2>Models</h2><div id="models"></div></div>
     <div>
@@ -995,46 +995,48 @@ def home():
     </div>
   </div>
 <script>
-let selected = null;
-let aggregationPoll = null;
+var selected = null;
+var aggregationPoll = null;
 
-async function api(path, opts={}) {
-  const res = await fetch(path, opts);
-  const text = await res.text();
-  let payload;
+async function api(path, opts) {
+  opts = opts || {};
+  var res = await fetch(path, opts);
+  var text = await res.text();
+  var payload;
   try { payload = JSON.parse(text); } catch(e) { payload = {raw:text}; }
-  if (!res.ok) return {http_status: res.status, error: payload};
+  if (!res.ok) payload.http_status = res.status;
   return payload;
 }
 
 function renderJob(job) {
-  const el = document.getElementById('jobSummary');
+  var el = document.getElementById('jobSummary');
   if (!job || !job.status || job.status === 'idle') {
-    el.style.display = 'none';
+    el.innerHTML = '<b>Aggregation job:</b> not started';
     return;
   }
-  el.style.display = 'block';
-  const logs = (job.logs || []).slice(-80).map(x => {
-    let line = `${x.time || ''} ${x.message || ''}`;
-    if (x.repo) line += ` repo=${x.repo}`;
-    if (x.current_page) line += ` page=${x.current_page}`;
-    if (x.total_seen) line += ` seen=${x.total_seen}`;
-    if (x.models_kept) line += ` kept=${x.models_kept}`;
-    if (x.repos_inspected) line += ` repos=${x.repos_inspected}`;
-    if (x.error) line += ` error=${x.error}`;
+  var rows = job.logs || [];
+  var logs = rows.slice(-80).map(function(x) {
+    var line = (x.time || '') + ' ' + (x.message || '');
+    if (x.repo) line += ' repo=' + x.repo;
+    if (x.current_page) line += ' page=' + x.current_page;
+    if (x.total_seen) line += ' seen=' + x.total_seen;
+    if (x.models_kept) line += ' kept=' + x.models_kept;
+    if (x.repos_inspected) line += ' repos=' + x.repos_inspected;
+    if (x.error) line += ' error=' + x.error;
     return line;
   }).join('\n');
-  el.innerHTML = `<b>Aggregation job:</b> ${job.status} &nbsp; ` +
-    `<span class="pill">page ${job.current_page || 0}/${job.pages || ''}</span>` +
-    `<span class="pill">seen ${job.total_seen || 0}</span>` +
-    `<span class="pill">kept ${job.models_kept || 0}</span>` +
-    `<span class="pill">repos ${job.repos_inspected || 0}</span>` +
-    `<span class="pill">single Cog ${job.single_cog || 0}</span>` +
-    `<div class="logbox">${logs}</div>`;
+  el.innerHTML = '<b>Aggregation job:</b> ' + job.status + ' &nbsp; ' +
+    '<span class="pill">page ' + (job.current_page || 0) + '/' + (job.pages || '') + '</span>' +
+    '<span class="pill">seen ' + (job.total_seen || 0) + '</span>' +
+    '<span class="pill">kept ' + (job.models_kept || 0) + '</span>' +
+    '<span class="pill">repos ' + (job.repos_inspected || 0) + '</span>' +
+    '<span class="pill">single Cog ' + (job.single_cog || 0) + '</span>' +
+    '<div class="logbox"></div>';
+  el.querySelector('.logbox').textContent = logs;
 }
 
 async function pollAggregation() {
-  const job = await api('/admin/aggregate/status');
+  var job = await api('/admin/aggregate/status');
   renderJob(job);
   if (job.status === 'running') {
     await loadModels();
@@ -1043,68 +1045,84 @@ async function pollAggregation() {
   if (job.status === 'done' || job.status === 'error') {
     if (aggregationPoll) clearInterval(aggregationPoll);
     aggregationPoll = null;
-    if (job.status === 'done') await loadModels();
+    await loadModels();
   }
 }
 
 async function loadModels() {
-  const q = encodeURIComponent(document.getElementById('search').value || '');
-  const task = encodeURIComponent(document.getElementById('task').value || '');
-  const cogOnly = document.getElementById('cogOnly').checked ? 'true' : 'false';
-  const data = await api(`/models?q=${q}&task=${task}&cog_only=${cogOnly}&limit=250`);
-  document.getElementById('summary').innerHTML = `<p>Manifest rows shown: ${data.models_count || 0}. Total manifest: ${data.manifest_models_count || 0}. Generated: ${data.manifest_generated_at || 'not yet'}<br>Source: ${data.gcs_target || ''}</p>`;
-  const el = document.getElementById('models');
+  var q = encodeURIComponent(document.getElementById('search').value || '');
+  var task = encodeURIComponent(document.getElementById('task').value || '');
+  var cogOnly = document.getElementById('cogOnly').checked ? 'true' : 'false';
+  var data = await api('/models?q=' + q + '&task=' + task + '&cog_only=' + cogOnly + '&limit=250');
+  if (data.http_status) {
+    document.getElementById('summary').innerHTML = '<p>Models request failed: HTTP ' + data.http_status + '</p>';
+    document.getElementById('status').textContent = JSON.stringify(data, null, 2);
+    return;
+  }
+  document.getElementById('summary').innerHTML = '<p>Manifest rows shown: ' + (data.models_count || 0) + '. Total manifest: ' + (data.manifest_models_count || 0) + '. Generated: ' + (data.manifest_generated_at || 'not yet') + '<br>Source: ' + (data.gcs_target || '') + '</p>';
+  var el = document.getElementById('models');
   el.innerHTML = '';
-  (data.models || []).forEach(m => {
-    const div = document.createElement('div');
+  (data.models || []).forEach(function(m) {
+    var div = document.createElement('div');
     div.className = 'card';
-    div.innerHTML = `<h3>${m.model_id}</h3><span class="pill">${m.task_bucket || ''}</span><span class="pill">${m.model_family || ''}</span><span class="pill">${m.candidate_status || ''}</span><div>${m.github_repo || ''}</div><div>Cog count: ${m.cog_count ?? ''}</div><div>Build: ${m.build_status || 'not built'}</div>${m.build_logs_url ? `<div><a href="${m.build_logs_url}" target="_blank">Build logs</a></div>` : ''}<p>${(m.description || '').slice(0,220)}</p><button>Select</button>`;
-    div.querySelector('button').onclick = () => selectModel(m.model_id);
+    var link = '';
+    if (m.build_logs_url) link = '<div><a href="' + m.build_logs_url + '" target="_blank">Build logs</a></div>';
+    div.innerHTML = '<h3>' + (m.model_id || '') + '</h3>' +
+      '<span class="pill">' + (m.task_bucket || '') + '</span>' +
+      '<span class="pill">' + (m.model_family || '') + '</span>' +
+      '<span class="pill">' + (m.candidate_status || '') + '</span>' +
+      '<div>' + (m.github_repo || '') + '</div>' +
+      '<div>Cog count: ' + (m.cog_count == null ? '' : m.cog_count) + '</div>' +
+      '<div>Build: ' + (m.build_status || 'not built') + '</div>' +
+      link + '<p>' + ((m.description || '').slice(0,220)) + '</p><button>Select</button>';
+    div.querySelector('button').onclick = function() { selectModel(m.model_id); };
     el.appendChild(div);
   });
 }
 
 async function selectModel(id) {
   selected = id;
-  const data = await api('/model?model_id=' + encodeURIComponent(id));
+  var data = await api('/model?model_id=' + encodeURIComponent(id));
   document.getElementById('title').textContent = id;
   document.getElementById('inputJson').value = JSON.stringify(data.default_input || {}, null, 2);
   document.getElementById('status').textContent = JSON.stringify(data, null, 2);
-  document.getElementById('actions').innerHTML = `<button onclick="buildSelected()">Build image</button><button onclick="statusSelected()">Check build status</button><button onclick="deploySelected()">Deploy L4 endpoint</button>`;
+  document.getElementById('actions').innerHTML = '<button onclick="buildSelected()">Build image</button><button onclick="statusSelected()">Check build status</button><button onclick="deploySelected()">Deploy L4 endpoint</button>';
 }
 
 async function buildSelected() {
   if (!selected) return;
-  const data = await api('/build?model_id=' + encodeURIComponent(selected), {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+  var data = await api('/build?model_id=' + encodeURIComponent(selected), {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
   document.getElementById('status').textContent = JSON.stringify(data, null, 2);
   loadModels();
 }
 
 async function statusSelected() {
   if (!selected) return;
-  const data = await api('/build/status?model_id=' + encodeURIComponent(selected));
+  var data = await api('/build/status?model_id=' + encodeURIComponent(selected));
   document.getElementById('status').textContent = JSON.stringify(data, null, 2);
   loadModels();
 }
 
 async function deploySelected() {
   if (!selected) return;
-  const data = await api('/deploy?model_id=' + encodeURIComponent(selected), {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+  var data = await api('/deploy?model_id=' + encodeURIComponent(selected), {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
   document.getElementById('status').textContent = JSON.stringify(data, null, 2);
   loadModels();
 }
 
 async function aggregateManifest() {
-  const data = await api('/admin/aggregate/start?limit=0&pages=200&inspect_github=true', {method:'POST'});
+  document.getElementById('jobSummary').innerHTML = '<b>Aggregation job:</b> starting...';
+  document.getElementById('status').textContent = 'Starting aggregation...';
+  var data = await api('/admin/aggregate/start?limit=0&pages=200&inspect_github=true', {method:'POST'});
   document.getElementById('status').textContent = JSON.stringify(data, null, 2);
   renderJob(data);
   if (aggregationPoll) clearInterval(aggregationPoll);
-  aggregationPoll = setInterval(pollAggregation, 2500);
+  aggregationPoll = setInterval(pollAggregation, 1000);
   pollAggregation();
 }
 
 async function reloadGcs() {
-  const data = await api('/admin/reload-gcs', {method:'POST'});
+  var data = await api('/admin/reload-gcs', {method:'POST'});
   document.getElementById('status').textContent = JSON.stringify(data, null, 2);
   loadModels();
 }
