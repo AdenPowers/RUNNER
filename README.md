@@ -19,9 +19,12 @@ Secret references:
 
 ## Flow
 
-1. `/admin/refresh` aggregates SDXL / small LLM candidates from Replicate and GitHub.
+1. `/admin/refresh` aggregates SDXL candidates from Replicate and GitHub.
 2. `/models` reads the saved local manifest.
 3. `/build?model_id=...` submits an independent Cloud Build job.
 4. Cloud Build installs Cog, clones the model repo, runs `cog push`, and pushes the image to Artifact Registry.
 5. `/build/status?model_id=...` reads Cloud Build status.
 6. `/deploy?model_id=...` deploys the built image to a Cloud Run L4 GPU service.
+
+
+This build is narrowed to SDXL image-model self-deployment only. Replicate data is used as metadata/sample input; endpoints are intended to be self-hosted on Cloud Run GPU after image build.

@@ -24,7 +24,7 @@ steps:
       - >-
         --image=$_AR_HOSTNAME/$_AR_PROJECT_ID/$_AR_REPOSITORY/runner-control/$_SERVICE_NAME:$COMMIT_SHA
       - '--region=$_DEPLOY_REGION'
-      - '--set-env-vars=GCP_PROJECT_ID=$_AR_PROJECT_ID,GCP_REGION=$_DEPLOY_REGION,ARTIFACT_REPOSITORY=model-images,MODEL_LIMIT=10'
+      - '--set-env-vars=GCP_PROJECT_ID=$_AR_PROJECT_ID,GCP_REGION=$_DEPLOY_REGION,ARTIFACT_REPOSITORY=model-images,MODEL_LIMIT=10,TARGET_MODEL_FAMILIES=sdxl'
       - '--quiet'
     id: Deploy
     entrypoint: gcloud

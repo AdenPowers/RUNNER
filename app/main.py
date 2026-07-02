@@ -34,7 +34,7 @@ MODEL_LIMIT = int(os.environ.get("MODEL_LIMIT", "25"))
 MAX_REPLICATE_PAGES = int(os.environ.get("MAX_REPLICATE_PAGES", "40"))
 TARGET_MODEL_FAMILIES = [
     x.strip().lower()
-    for x in os.environ.get("TARGET_MODEL_FAMILIES", "sdxl,small-llm").split(",")
+    for x in os.environ.get("TARGET_MODEL_FAMILIES", "sdxl").split(",")
     if x.strip()
 ]
 
@@ -160,31 +160,40 @@ def classify_model(raw: Dict[str, Any], slim: Dict[str, Any]) -> Optional[Dict[s
         "stable-diffusion-xl",
         "stable diffusion xl",
         "stable diffusion-xl",
+        "sdxl-base",
         "xl-base",
         "xl base",
-        "sdxl-base",
         "sdxl refiner",
         "sdxl lora",
     ]
-    if "sdxl" in TARGET_MODEL_FAMILIES and any(term in text for term in sdxl_terms):
-        return {"task_bucket": "image", "model_family": "sdxl"}
-
-    llm_terms = [
-        "llm",
-        "text-generation",
-        "text generation",
-        "chat model",
-        "mistral",
-        "llama",
-        "gemma",
-        "qwen",
-        "phi-",
-        "phi ",
-        "tinyllama",
+    image_terms = [
+        "image",
+        "txt2img",
+        "text-to-image",
+        "text to image",
+        "diffusion",
+        "stable",
+        "lora",
+        "refiner",
     ]
-    small_terms = ["0.5b", "1b", "1.5b", "2b", "3b", "4b", "7b", "tiny", "small", "mini"]
-    if "small-llm" in TARGET_MODEL_FAMILIES and any(t in text for t in llm_terms) and any(t in text for t in small_terms):
-        return {"task_bucket": "llm", "model_family": "small-llm"}
+
+    if "sdxl" in TARGET_MODEL_FAMILIES and any(term in text for term in sdxl_terms):
+        return {
+            "task_bucket": "image",
+            "model_family": "sdxl",
+            "deployment_mode": "self_deploy",
+            "hosted_provider": "none",
+            "classification_reason": "matched_sdxl_terms",
+        }
+
+    if "sdxl" in TARGET_MODEL_FAMILIES and "stable diffusion" in text and "xl" in text and any(term in text for term in image_terms):
+        return {
+            "task_bucket": "image",
+            "model_family": "sdxl",
+            "deployment_mode": "self_deploy",
+            "hosted_provider": "none",
+            "classification_reason": "matched_stable_diffusion_xl_image_terms",
+        }
 
     return None
 
@@ -365,7 +374,8 @@ def aggregate_target_manifest(limit: int = MODEL_LIMIT) -> Dict[str, Any]:
 
             enriched = dict(m)
             enriched.update(family)
-            enriched["source"] = "replicate"
+            enriched["source"] = "replicate_metadata_github_self_deploy"
+            enriched["sample_input_source"] = "replicate_default_example"
             enriched["candidate_status"] = "target_single_cog_confident"
             enriched["repo"] = {
                 "repo_key": repo,
@@ -388,6 +398,8 @@ def aggregate_target_manifest(limit: int = MODEL_LIMIT) -> Dict[str, Any]:
         "generated_at": now_iso(),
         "source": "replicate+github",
         "target_model_families": TARGET_MODEL_FAMILIES,
+        "deployment_mode": "self_deploy",
+        "target_task_bucket": "image",
         "max_replicate_pages": MAX_REPLICATE_PAGES,
         "models_count": len(kept),
         "skipped_counts": skipped,
@@ -402,6 +414,8 @@ def default_manifest() -> Dict[str, Any]:
         "schema_version": "runner-manifest-v1",
         "generated_at": None,
         "source": "empty-seed",
+        "deployment_mode": "self_deploy",
+        "target_task_bucket": "image",
         "target_model_families": TARGET_MODEL_FAMILIES,
         "models_count": 0,
         "models": [],
@@ -746,7 +760,7 @@ def home():
 <!doctype html>
 <html>
 <head>
-  <title>Runner Control</title>
+  <title>Runner SDXL Self-Deploy Control</title>
   <style>
     body { font-family: system-ui, sans-serif; background:#0b0f17; color:#f2f2f2; margin:24px; }
     .grid { display:grid; grid-template-columns: 420px 1fr; gap:20px; }
@@ -759,8 +773,8 @@ def home():
   </style>
 </head>
 <body>
-  <h1>Runner Control</h1>
-  <button onclick="refreshManifest()">Aggregate SDXL / small LLM candidates</button>
+  <h1>Runner SDXL Self-Deploy Control</h1>
+  <button onclick="refreshManifest()">Aggregate SDXL self-deploy candidates</button>
   <button onclick="loadModels()">Reload manifest</button>
   <div id="summary"></div>
   <div class="grid">
@@ -771,9 +785,9 @@ def home():
     <div>
       <h2 id="title">Select a model</h2>
       <div id="actions"></div>
-      <h3>Default Input JSON</h3>
+      <h3>Sample Input JSON <small>(from Replicate metadata, not hosting)</small></h3>
       <textarea id="inputJson">{}</textarea>
-      <h3>Schema / Status</h3>
+      <h3>Self-Deploy Metadata / Build Status</h3>
       <pre id="status">{}</pre>
     </div>
   </div>
@@ -792,7 +806,7 @@ async function api(path, opts={}) {
 
 async function loadModels() {
   const data = await api('/models');
-  document.getElementById('summary').innerHTML = `<p>Manifest: ${data.models_count || 0} models. Generated: ${data.manifest_generated_at || 'not yet'}</p>`;
+  document.getElementById('summary').innerHTML = `<p>SDXL self-deploy manifest: ${data.models_count || 0} models. Generated: ${data.manifest_generated_at || 'not yet'}</p>`;
   const el = document.getElementById('models');
   el.innerHTML = '';
   (data.models || []).forEach(m => {
@@ -800,8 +814,9 @@ async function loadModels() {
     div.className = 'card';
     div.innerHTML = `
       <h3>${m.model_id}</h3>
-      <span class="pill">${m.task_bucket || ''}</span><span class="pill">${m.model_family || ''}</span>
+      <span class="pill">${m.task_bucket || ''}</span><span class="pill">${m.model_family || ''}</span><span class="pill">self-deploy</span>
       <div>${m.github_repo || ''}</div>
+      <div>Image: ${m.image_uri ? 'planned/available' : 'not planned'}</div>
       <div>Build: ${m.build_status || 'not built'}</div>
       <div>Deploy: ${m.deploy_status || 'not deployed'}</div>
       ${m.build_logs_url ? `<div><a href="${m.build_logs_url}" target="_blank">Build logs</a></div>` : ''}
