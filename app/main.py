@@ -4,13 +4,12 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 from urllib.parse import quote, urlparse
 
 import requests
-import yaml
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from google.cloud.devtools import cloudbuild_v1
@@ -309,9 +308,7 @@ def image_uri_for(model: Dict[str, Any]) -> str:
 
 def cloud_build_config(model: Dict[str, Any], image_uri: str) -> Dict[str, Any]:
     repo = model["github_repo"]
-    cog_path = model["repo"]["cog_paths"][0]["cog_file_path"]
     project_route = model["repo"]["cog_paths"][0].get("project_route") or "."
-    repo_name = repo.split("/")[-1]
 
     script = f"""
 set -eux
@@ -345,7 +342,6 @@ cog push {image_uri}
 def submit_cloud_build(model: Dict[str, Any]) -> Dict[str, Any]:
     image_uri = image_uri_for(model)
     client = cloudbuild_v1.CloudBuildClient()
-    parent = f"projects/{GCP_PROJECT_ID}/locations/{GCP_REGION}"
     build = cloud_build_config(model, image_uri)
 
     operation = client.create_build(project_id=GCP_PROJECT_ID, build=build)
@@ -478,7 +474,7 @@ def models():
     return {"models": rows}
 
 
-@app.get("/models/{model_id:path}")
+@app.get("/model")
 def model_detail(model_id: str):
     model = get_model(model_id)
     rec = state()["models"].get(model_id, {})
@@ -490,7 +486,7 @@ def model_detail(model_id: str):
     }
 
 
-@app.post("/models/{model_id:path}/build")
+@app.post("/build")
 def build_model(model_id: str, req: BuildRequest = BuildRequest()):
     model = get_model(model_id)
     rec = state()["models"].get(model_id, {})
@@ -499,7 +495,7 @@ def build_model(model_id: str, req: BuildRequest = BuildRequest()):
     return submit_cloud_build(model)
 
 
-@app.post("/models/{model_id:path}/deploy")
+@app.post("/deploy")
 def deploy_model(model_id: str, req: DeployRequest = DeployRequest()):
     model = get_model(model_id)
     return deploy_cloud_run_gpu(model)
@@ -569,7 +565,7 @@ async function loadModels() {
 
 async function selectModel(id) {
   selected = id;
-  const data = await api('/models/' + encodeURIComponent(id));
+  const data = await api('/model?model_id=' + encodeURIComponent(id));
   document.getElementById('title').textContent = id;
   document.getElementById('inputJson').value = JSON.stringify(data.default_input || {}, null, 2);
   document.getElementById('status').textContent = JSON.stringify(data, null, 2);
@@ -581,13 +577,13 @@ async function selectModel(id) {
 
 async function buildSelected() {
   if (!selected) return;
-  const data = await api('/models/' + encodeURIComponent(selected) + '/build', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+  const data = await api('/build?model_id=' + encodeURIComponent(selected), {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
   document.getElementById('status').textContent = JSON.stringify(data, null, 2);
 }
 
 async function deploySelected() {
   if (!selected) return;
-  const data = await api('/models/' + encodeURIComponent(selected) + '/deploy', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+  const data = await api('/deploy?model_id=' + encodeURIComponent(selected), {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
   document.getElementById('status').textContent = JSON.stringify(data, null, 2);
 }
 
