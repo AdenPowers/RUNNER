@@ -693,6 +693,7 @@ def aggregate_replicate_manifest(
     )
     return final_manifest
 
+
 def default_manifest() -> Dict[str, Any]:
     return {
         "schema_version": "replicate-manifest-v1",
@@ -1064,7 +1065,7 @@ function renderJob(job) {
     if (x.repos_inspected) line += ` repos=${x.repos_inspected}`;
     if (x.error) line += ` error=${x.error}`;
     return line;
-  }).join('\n');
+  }).join('\\n');
   el.innerHTML = `<b>Aggregation job:</b> ${job.status} &nbsp; ` +
     `<span class="pill">page ${job.current_page || 0}/${job.pages || ''}</span>` +
     `<span class="pill">seen ${job.total_seen || 0}</span>` +
@@ -1135,13 +1136,50 @@ async function deploySelected() {
 }
 
 async function aggregateManifest() {
-  document.getElementById('status').textContent = 'UI ITERATION 001 — native-refresh-10\nRunning native aggregate: limit=10 pages=1...';
-  const data = await api('/admin/refresh?limit=10&pages=1&inspect_github=true', {method:'POST'});
-  document.getElementById('status').textContent = JSON.stringify(data, null, 2);
-  renderJob(data);
-  if (aggregationPoll) clearInterval(aggregationPoll);
-  aggregationPoll = setInterval(pollAggregation, 2500);
-  pollAggregation();
+  const status = document.getElementById('status');
+  status.textContent =
+    'CLICKED: aggregateManifest entered\\n' +
+    'FETCH START: /admin/refresh?limit=10&pages=1&inspect_github=true';
+
+  console.log('CLICKED aggregateManifest');
+
+  try {
+    const res = await fetch('/admin/refresh?limit=10&pages=1&inspect_github=true', {method:'POST'});
+    const text = await res.text();
+
+    status.textContent =
+      'RESPONSE RECEIVED\\n' +
+      'HTTP ' + res.status + '\\n\\n' +
+      text;
+
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch (e) {
+      status.textContent += '\\n\\nJSON PARSE ERROR:\\n' + (e && e.stack ? e.stack : String(e));
+      console.error('JSON PARSE ERROR', e);
+      return;
+    }
+
+    try {
+      renderJob(data);
+    } catch (e) {
+      status.textContent += '\\n\\nrenderJob ERROR:\\n' + (e && e.stack ? e.stack : String(e));
+      console.error('renderJob ERROR', e);
+    }
+
+    try {
+      await loadModels();
+    } catch (e) {
+      status.textContent += '\\n\\nloadModels ERROR:\\n' + (e && e.stack ? e.stack : String(e));
+      console.error('loadModels ERROR', e);
+    }
+  } catch (e) {
+    status.textContent =
+      'FETCH / JS ERROR:\\n' +
+      (e && e.stack ? e.stack : String(e));
+    console.error('aggregateManifest FETCH / JS ERROR', e);
+  }
 }
 
 async function reloadGcs() {
