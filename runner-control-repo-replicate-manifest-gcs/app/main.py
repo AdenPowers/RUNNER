@@ -932,7 +932,7 @@ async function selectModel(id) { selected = id; const data = await api('/model?m
 async function buildSelected() { if (!selected) return; const data = await api('/build?model_id=' + encodeURIComponent(selected), {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'}); document.getElementById('status').textContent = JSON.stringify(data, null, 2); loadModels(); }
 async function statusSelected() { if (!selected) return; const data = await api('/build/status?model_id=' + encodeURIComponent(selected)); document.getElementById('status').textContent = JSON.stringify(data, null, 2); loadModels(); }
 async function deploySelected() { if (!selected) return; const data = await api('/deploy?model_id=' + encodeURIComponent(selected), {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'}); document.getElementById('status').textContent = JSON.stringify(data, null, 2); loadModels(); }
-async function aggregateManifest() { const data = await api('/admin/refresh?limit=0&pages=200&inspect_github=true', {method:'POST'}); document.getElementById('status').textContent = JSON.stringify(data, null, 2); loadModels(); }
+async function aggregateManifest() { document.getElementById('status').textContent = 'Running native aggregate: limit=10 pages=1...'; const data = await api('/admin/refresh?limit=10&pages=1&inspect_github=true', {method:'POST'}); document.getElementById('status').textContent = JSON.stringify(data, null, 2); loadModels(); }
 async function reloadGcs() { const data = await api('/admin/reload-gcs', {method:'POST'}); document.getElementById('status').textContent = JSON.stringify(data, null, 2); loadModels(); }
 loadModels();
 </script>

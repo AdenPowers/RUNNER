@@ -918,8 +918,9 @@ def refresh_manifest(
     pages: int = Query(default=MAX_REPLICATE_PAGES, ge=1, le=1000),
     inspect_github: bool = Query(default=True),
 ):
-    # Backward-compatible endpoint. This now starts the background job instead of blocking the browser request.
-    return start_aggregation_job(limit=limit, pages=pages, inspect_github=inspect_github)
+    # Native/synchronous path: run the same aggregate function directly in this request.
+    # Use small limits from the UI for debugging; full crawls should be run from terminal/script.
+    return aggregate_replicate_manifest(limit=limit, pages=pages, inspect_github=inspect_github)
 
 
 @app.get("/models")
@@ -1130,7 +1131,8 @@ async function deploySelected() {
 }
 
 async function aggregateManifest() {
-  const data = await api('/admin/aggregate/start?limit=0&pages=200&inspect_github=true', {method:'POST'});
+  document.getElementById('status').textContent = 'Running native aggregate: limit=10 pages=1...';
+  const data = await api('/admin/refresh?limit=10&pages=1&inspect_github=true', {method:'POST'});
   document.getElementById('status').textContent = JSON.stringify(data, null, 2);
   renderJob(data);
   if (aggregationPoll) clearInterval(aggregationPoll);
