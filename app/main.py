@@ -146,57 +146,88 @@ def flatten_for_search(value: Any) -> str:
 
 
 def classify_model(raw: Dict[str, Any], slim: Dict[str, Any]) -> Optional[Dict[str, str]]:
-    text = " ".join([
+    """Keep only actual SDXL-family self-deploy candidates.
+
+    Deliberately excludes generic workflow runners such as ComfyUI/Automatic1111.
+    Those can run SDXL checkpoints, but they are not curated SDXL model endpoints.
+    """
+    identity_text = " ".join([
         str(slim.get("model_id") or ""),
         str(slim.get("name") or ""),
         str(slim.get("description") or ""),
         str(slim.get("github_repo") or ""),
+        str(slim.get("github_url") or ""),
+    ]).lower()
+
+    metadata_text = " ".join([
+        identity_text,
         flatten_for_search(slim.get("default_example")),
         flatten_for_search(slim.get("latest_version", {}).get("openapi_schema")),
     ]).lower()
 
-    sdxl_terms = [
+    workflow_shell_terms = [
+        "comfyui",
+        "any-comfyui",
+        "comfy workflow",
+        "workflow_json",
+        "workflow json",
+        "automatic1111",
+        "a1111",
+        "stable-diffusion-webui",
+        "webui",
+    ]
+    if any(term in metadata_text for term in workflow_shell_terms):
+        return None
+
+    # Require SDXL evidence in the model/repo identity, not merely buried in sample input.
+    # This avoids generic workflow runners whose prompts mention SDXL checkpoints.
+    sdxl_identity_terms = [
         "sdxl",
         "stable-diffusion-xl",
         "stable diffusion xl",
         "stable diffusion-xl",
-        "sdxl-base",
+        "stable_diffusion_xl",
+        "realvisxl",
+        "juggernaut-xl",
+        "juggernautxl",
+        "dreamshaper-xl",
+        "dreamshaperxl",
+        "sdxl-lightning",
+        "sdxl-turbo",
+        "sdxl-lcm",
+        "segmind-vega",
+        "ssd-1b",
         "xl-base",
-        "xl base",
-        "sdxl refiner",
-        "sdxl lora",
+        "xl-refiner",
     ]
-    image_terms = [
+
+    if "sdxl" not in TARGET_MODEL_FAMILIES:
+        return None
+
+    if not any(term in identity_text for term in sdxl_identity_terms):
+        return None
+
+    image_evidence_terms = [
         "image",
         "txt2img",
         "text-to-image",
         "text to image",
         "diffusion",
-        "stable",
         "lora",
         "refiner",
+        "inpaint",
+        "controlnet",
     ]
+    if not any(term in metadata_text for term in image_evidence_terms):
+        return None
 
-    if "sdxl" in TARGET_MODEL_FAMILIES and any(term in text for term in sdxl_terms):
-        return {
-            "task_bucket": "image",
-            "model_family": "sdxl",
-            "deployment_mode": "self_deploy",
-            "hosted_provider": "none",
-            "classification_reason": "matched_sdxl_terms",
-        }
-
-    if "sdxl" in TARGET_MODEL_FAMILIES and "stable diffusion" in text and "xl" in text and any(term in text for term in image_terms):
-        return {
-            "task_bucket": "image",
-            "model_family": "sdxl",
-            "deployment_mode": "self_deploy",
-            "hosted_provider": "none",
-            "classification_reason": "matched_stable_diffusion_xl_image_terms",
-        }
-
-    return None
-
+    return {
+        "task_bucket": "image",
+        "model_family": "sdxl",
+        "deployment_mode": "self_deploy",
+        "hosted_provider": "none",
+        "classification_reason": "matched_sdxl_identity_not_workflow_shell",
+    }
 
 def slim_model(m: Dict[str, Any]) -> Dict[str, Any]:
     latest = m.get("latest_version") or {}
@@ -453,11 +484,11 @@ def cloud_build_payload(model: Dict[str, Any], image_uri: str) -> Dict[str, Any]
     auth_script = f"""
 set -euxo pipefail
 export DOCKER_CONFIG=/workspace/.docker
-mkdir -p "$DOCKER_CONFIG"
-TOKEN="$(gcloud auth print-access-token)"
-AUTH="$(printf 'oauth2accesstoken:%s' "$TOKEN" | base64 | tr -d '\n')"
-cat > "$DOCKER_CONFIG/config.json" <<EOF
-{{"auths":{{"{registry_host}":{{"auth":"$AUTH"}}}}}}
+mkdir -p "$$DOCKER_CONFIG"
+TOKEN="$$(gcloud auth print-access-token)"
+AUTH="$$(printf 'oauth2accesstoken:%s' "$$TOKEN" | base64 | tr -d '\n')"
+cat > "$$DOCKER_CONFIG/config.json" <<EOF
+{{"auths":{{"{registry_host}":{{"auth":"$$AUTH"}}}}}}
 EOF
 """
 
