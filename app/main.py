@@ -34,7 +34,7 @@ GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "")
 GCP_REGION = os.environ.get("GCP_REGION", "us-central1")
 ARTIFACT_REPOSITORY = os.environ.get("ARTIFACT_REPOSITORY", "model-images")
 MODEL_LIMIT = int(os.environ.get("MODEL_LIMIT", "0"))  # 0 means no model-count cap
-MAX_REPLICATE_PAGES = int(os.environ.get("MAX_REPLICATE_PAGES", "200"))
+MAX_REPLICATE_PAGES = int(os.environ.get("MAX_REPLICATE_PAGES", "0"))  # 0 means no Replicate page cap
 MANIFEST_BUCKET = os.environ.get("MANIFEST_BUCKET", "backendoutputs")
 MANIFEST_OBJECT = os.environ.get("MANIFEST_OBJECT", "Manifest/replicate_manifest.json")
 USE_GCS_MANIFEST = os.environ.get("USE_GCS_MANIFEST", "true").lower() not in {"0", "false", "no"}
@@ -534,7 +534,7 @@ def aggregate_replicate_manifest(
 
     emit("replicate crawl starting", current_page=0, total_seen=0, models_kept=0)
 
-    while url and page < pages:
+    while url and (not pages or page < pages):
         page += 1
         emit("fetching replicate page", current_page=page, total_seen=counts["total_seen"], models_kept=len(kept))
         data = http_get_json(url, headers_replicate())
@@ -901,8 +901,8 @@ def reload_gcs_manifest():
 
 @app.post("/admin/aggregate/start")
 def aggregate_start(
-    limit: int = Query(default=MODEL_LIMIT, ge=0, le=5000),
-    pages: int = Query(default=MAX_REPLICATE_PAGES, ge=1, le=1000),
+    limit: int = Query(default=MODEL_LIMIT, ge=0),
+    pages: int = Query(default=MAX_REPLICATE_PAGES, ge=0),
     inspect_github: bool = Query(default=True),
 ):
     return start_aggregation_job(limit=limit, pages=pages, inspect_github=inspect_github)
@@ -915,17 +915,17 @@ def aggregate_status():
 
 @app.post("/admin/refresh")
 def refresh_manifest(
-    limit: int = Query(default=MODEL_LIMIT, ge=0, le=5000),
-    pages: int = Query(default=MAX_REPLICATE_PAGES, ge=1, le=1000),
+    limit: int = Query(default=MODEL_LIMIT, ge=0),
+    pages: int = Query(default=MAX_REPLICATE_PAGES, ge=0),
     inspect_github: bool = Query(default=True),
 ):
     # Native/synchronous path: run the same aggregate function directly in this request.
-    # Use small limits from the UI for debugging; full crawls should be run from terminal/script.
+    # Full crawls are controlled by environment variables. 0 means uncapped.
     return aggregate_replicate_manifest(limit=limit, pages=pages, inspect_github=inspect_github)
 
 
 @app.get("/models")
-def models(q: str = "", task: str = "", cog_only: bool = False, limit: int = 250):
+def models(q: str = "", task: str = "", cog_only: bool = False, limit: int = 0):
     manifest = load_manifest(refresh_from_gcs=aggregation_snapshot().get("status") != "running")
     s = state()
     ql = q.lower().strip()
@@ -1012,7 +1012,7 @@ def home():
   </style>
 </head>
 <body>
-  <div class="iteration-badge">UI ITERATION 002 — env-driven-refresh</div>
+  <div class="iteration-badge">UI ITERATION 003 — no-app-caps</div>
   <div class="iteration-spacer"></div>
   <h1>Runner Replicate Manifest Control</h1>
   <button onclick="aggregateManifest()">Aggregate Replicate manifest → GCS</button>
@@ -1092,7 +1092,7 @@ async function loadModels() {
   const q = encodeURIComponent(document.getElementById('search').value || '');
   const task = encodeURIComponent(document.getElementById('task').value || '');
   const cogOnly = document.getElementById('cogOnly').checked ? 'true' : 'false';
-  const data = await api(`/models?q=${q}&task=${task}&cog_only=${cogOnly}&limit=250`);
+  const data = await api(`/models?q=${q}&task=${task}&cog_only=${cogOnly}&limit=0`);
   document.getElementById('summary').innerHTML = `<p>Manifest rows shown: ${data.models_count || 0}. Total manifest: ${data.manifest_models_count || 0}. Generated: ${data.manifest_generated_at || 'not yet'}<br>Source: ${data.gcs_target || ''}</p>`;
   const el = document.getElementById('models');
   el.innerHTML = '';
