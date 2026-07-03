@@ -1012,7 +1012,7 @@ def home():
   </style>
 </head>
 <body>
-  <div class="iteration-badge">UI ITERATION 001 — native-refresh-10</div>
+  <div class="iteration-badge">UI ITERATION 002 — env-driven-refresh</div>
   <div class="iteration-spacer"></div>
   <h1>Runner Replicate Manifest Control</h1>
   <button onclick="aggregateManifest()">Aggregate Replicate manifest → GCS</button>
@@ -1139,12 +1139,12 @@ async function aggregateManifest() {
   const status = document.getElementById('status');
   status.textContent =
     'CLICKED: aggregateManifest entered\\n' +
-    'FETCH START: /admin/refresh?limit=10&pages=1&inspect_github=true';
+    'FETCH START: /admin/refresh?inspect_github=true';
 
   console.log('CLICKED aggregateManifest');
 
   try {
-    const res = await fetch('/admin/refresh?limit=10&pages=1&inspect_github=true', {method:'POST'});
+    const res = await fetch('/admin/refresh?inspect_github=true', {method:'POST'});
     const text = await res.text();
 
     status.textContent =
