@@ -756,6 +756,7 @@ EOF
     cog_script = f"""
 set -euxo pipefail
 export DOCKER_CONFIG=/workspace/.docker
+export DOCKER_BUILDKIT=0
 apt-get update
 apt-get install -y --no-install-recommends curl git ca-certificates
 curl -L -o /usr/local/bin/cog https://github.com/replicate/cog/releases/latest/download/cog_Linux_x86_64
@@ -763,13 +764,14 @@ chmod +x /usr/local/bin/cog
 git clone --depth 1 https://github.com/{repo}.git /workspace/modelrepo
 cd /workspace/modelrepo/{project_route}
 cog --version
-cog push {image_uri}
+cog build -t {image_uri}
+docker push {image_uri}
 """
 
     return {
         "steps": [
             {"name": "gcr.io/google.com/cloudsdktool/cloud-sdk:slim", "id": "Configure Docker auth for Artifact Registry", "entrypoint": "bash", "args": ["-lc", auth_script]},
-            {"name": "gcr.io/cloud-builders/docker", "id": "Cog push model image", "entrypoint": "bash", "args": ["-lc", cog_script], "env": ["DOCKER_CONFIG=/workspace/.docker"]},
+            {"name": "gcr.io/cloud-builders/docker", "id": "Cog build and docker push model image", "entrypoint": "bash", "args": ["-lc", cog_script], "env": ["DOCKER_CONFIG=/workspace/.docker"]},
         ],
         "timeout": "7200s",
         "options": {"logging": "CLOUD_LOGGING_ONLY", "diskSizeGb": "200"},
