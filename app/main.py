@@ -1012,7 +1012,7 @@ def home():
   </style>
 </head>
 <body>
-  <div class="iteration-badge">UI ITERATION 003 — no-app-caps</div>
+  <div class="iteration-badge">UI ITERATION 004 — uncapped-background-crawl</div>
   <div class="iteration-spacer"></div>
   <h1>Runner Replicate Manifest Control</h1>
   <button onclick="aggregateManifest()">Aggregate Replicate manifest → GCS</button>
@@ -1139,12 +1139,12 @@ async function aggregateManifest() {
   const status = document.getElementById('status');
   status.textContent =
     'CLICKED: aggregateManifest entered\\n' +
-    'FETCH START: /admin/refresh?inspect_github=true';
+    'FETCH START: /admin/aggregate/start?inspect_github=true';
 
   console.log('CLICKED aggregateManifest');
 
   try {
-    const res = await fetch('/admin/refresh?inspect_github=true', {method:'POST'});
+    const res = await fetch('/admin/aggregate/start?inspect_github=true', {method:'POST'});
     const text = await res.text();
 
     status.textContent =
@@ -1168,12 +1168,10 @@ async function aggregateManifest() {
       console.error('renderJob ERROR', e);
     }
 
-    try {
-      await loadModels();
-    } catch (e) {
-      status.textContent += '\\n\\nloadModels ERROR:\\n' + (e && e.stack ? e.stack : String(e));
-      console.error('loadModels ERROR', e);
-    }
+    if (aggregationPoll) clearInterval(aggregationPoll);
+    aggregationPoll = setInterval(pollAggregation, 2500);
+    await pollAggregation();
+
   } catch (e) {
     status.textContent =
       'FETCH / JS ERROR:\\n' +
